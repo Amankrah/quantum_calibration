@@ -254,4 +254,4 @@ src/
 
 ## License / naming
 
-The package name in `Cargo.toml` is **`test_rust_project`** (workspace default). For publication or interviews, consider renaming the crate and repository to match your product or paper; the **module and type names** inside `src/` are already domain-oriented (`QuantumHardware`, `CalibrationParams`, etc.).
+The package name in `Cargo.toml` is **`test_rust_project`** (workspace default). The **module and type names** inside `src/` are already domain-oriented (`QuantumHardware`, `CalibrationParams`, etc.).
