@@ -1,10 +1,12 @@
 # Quantum Calibration & Control (Rust)
 
-A **simulation and architecture reference** for automated calibration of gate-based superconducting qubits. The code models how a production system could **replace repetitive technician workflows** with software: scheduled jobs, parallel per-qubit routines, a hardware abstraction, persistent parameters, and a health layer that escalates only when automation cannot recover.
+**Crate:** `quantum_calibration`
 
-The design is intentionally analogous to a **hospital monitoring system**: vitals are checked on a policy, automated responses handle known conditions, and humans are notified for serious or persistent problems—not for every routine measurement.
+A **simulation and architecture reference** for automated calibration of gate-based superconducting qubits. The code models how a production system could **replace repetitive technician workflows** with software: scheduled jobs, parallel per-qubit routines, a hardware abstraction, persistent parameters, a health layer, and **AI/ML hooks** for predictive drift and model selection.
 
-> **Scope:** This repository does **not** drive real instruments. It uses a **mock quantum hardware** implementation so the full control loop is testable in CI and runnable without lab equipment. The same trait boundary is where a real firmware/driver stack would plug in.
+The design is intentionally analogous to a **hospital monitoring system**: vitals are checked on a policy, automated responses handle known conditions, and humans are notified for serious or persistent problems—not for every routine measurement. The **predictive drift** layer adds a data-driven notion of *when* to intervene, instead of relying only on a fixed clock.
+
+> **Scope:** This repository does **not** drive real instruments. It uses **mock quantum hardware** so the full control loop is testable in CI and runnable without lab equipment. The **`QuantumHardware`** and **`DriftForecastModel`** (ML trait) boundaries are where real firmware, drivers, or Python ML stacks would plug in.
 
 ---
 
@@ -14,19 +16,22 @@ The design is intentionally analogous to a **hospital monitoring system**: vital
 - [Quick start](#quick-start)
 - [Architecture overview](#architecture-overview)
 - [Layer-by-layer technical description](#layer-by-layer-technical-description)
+- [AI / ML integration](#ai--ml-integration)
 - [Data flow (one calibration cycle)](#data-flow-one-calibration-cycle)
 - [Pulse schedules and crosstalk checks](#pulse-schedules-and-crosstalk-checks)
 - [Supporting modules (library)](#supporting-modules-library)
+- [Incremental calibration](#incremental-calibration)
 - [Testing](#testing)
-- [Design tradeoffs and production notes](#design-tradeoffs-and-production-notes)
+- [Current limitations](#current-limitations)
+- [Future improvements](#future-improvements)
 - [Repository layout](#repository-layout)
 
 ---
 
 ## Requirements
 
-- **Rust** toolchain with support for **Edition 2024** (as set in `Cargo.toml`).
-- **Tokio** and **async-trait** (declared in `Cargo.toml`); no other third-party dependencies.
+- **Rust** toolchain with support for **Edition 2024** (see `Cargo.toml`).
+- **Tokio** and **async-trait**; no other third-party dependencies.
 
 ---
 
@@ -38,29 +43,33 @@ cargo run
 cargo test
 ```
 
-- **`cargo run`** executes `src/main.rs`: a **two-pass** calibration pipeline (full calibration, then **incremental** pass) on a **two-qubit** mock machine, printing per-qubit parameters, benchmark status, health alerts (if any), and a parameter-store summary.
-- **`cargo test`** runs unit tests for spectroscopy sweep accuracy, schedule policy, parallel calibration + store integration, and the synchronous mock suite in `calibration`.
+- **`cargo run`** runs the **`quantum_calibration`** binary (`src/main.rs`), which calls **`quantum_calibration::demo::run_all_demos()`** (`src/demo.rs`):
+  1. **Calibration pipeline** — two passes (full, then incremental) on a two-qubit mock; prints parameters, benchmark, health alerts, parameter-store summary.
+  2. **AI / ML demo** — `PredictiveDriftDetector` with synthetic frequency history, urgency ranking, and **`ModelEvaluator`** LOOCV rankings plus best-model selection on a steady-drift series.
+- **`cargo test`** — 12+ unit tests (calibration, schedule, parallel jobs, drift predictor, ML models).
 
 ---
 
 ## Architecture overview
 
-The library is organized into **five conceptual layers** (documented in `src/lib.rs`):
+Core stack (**five layers** in `src/lib.rs`):
 
 | Layer | Module(s) | Role |
 |-------|-----------|------|
-| **1 — Scheduler** | `job_scheduler` | Triggers work on a timer or tick; runs **one logical “round”** by spawning **parallel** per-qubit tasks (Tokio). |
-| **2 — Calibration routines** | `routines` | Async steps: frequency sweep, T1/T2, gate tune, crosstalk template validation; each returns `Result`. |
-| **3 — Hardware interface** | `hardware` | `QuantumHardware` trait: `send_pulse` / `read_result`; **`MockQuantumHardware`** for tests and demos. |
-| **4 — Parameter store** | `parameter_store` | Persists **last known good** `CalibrationParams` per qubit with a **generation** counter; failed runs do **not** delete prior rows. |
-| **5 — Health monitor** | `health` | Applies thresholds, emits **drift** warnings, tracks **consecutive failures**, and raises **human escalation** after a fixed streak. |
+| **1 — Scheduler** | `job_scheduler` | Tokio parallel per-qubit calibration cycle; optional periodic loop sketch. |
+| **2 — Calibration routines** | `routines` | Async frequency sweep, T1/T2, gate tune, crosstalk template; `Result` per step. |
+| **3 — Hardware** | `hardware` | `QuantumHardware` trait + `MockQuantumHardware`. |
+| **4 — Parameter store** | `parameter_store` | Last known good `CalibrationParams` + generation; no erase on failure. |
+| **5 — Health** | `health` | Thresholds, drift warnings, escalation after repeated failure. |
 
-Additional modules provide shared types, pulse scheduling, and **synchronous** policy/helpers used by tests or future orchestration:
+**AI / ML (cross-cutting):**
 
-- `calibration` — `QubitId`, `QubitCalibration`, `CalibrationReport`, `MockTransmonSystem` (sync shortcut), `run_validation_benchmark`.
-- `pulse` — `Pulse`, validation, temporal **conflict** detection on schedules.
-- `schedule` — Pure functions: **when** recalibration is due (periodic vs cold start vs chip-swap priority).
-- `controller` — `CalibrationController` tying **policy** to the **sync** mock machine (not used by the default `main` binary).
+| Module | Role |
+|--------|------|
+| **`drift_predictor`** | Rolling **frequency history** per qubit, **linear regression** drift rate, **time-to-tolerance** estimate, fleet **`qubits_due_within`**. Complements fixed-interval `schedule::calibration_due`. |
+| **`ml_models`** | **`DriftForecastModel`** trait (Rust-native models + future PyO3 backends), **LinearRegression**, **ExponentialDecay**, **MovingAverage**, **LOOCV** **`ModelEvaluator`** to rank and **`select_best`**. |
+
+Also: `calibration`, `pulse`, `schedule`, `controller` (see below).
 
 ---
 
@@ -68,165 +77,118 @@ Additional modules provide shared types, pulse scheduling, and **synchronous** p
 
 ### 1. Scheduler (`src/job_scheduler.rs`)
 
-- **`run_calibration_cycle_parallel`**  
-  - Input: slice of qubit IDs, shared `Arc<dyn QuantumHardware>`, `ParameterStore`, `Arc<Mutex<HealthMonitor>>`, `HealthThresholds`, and an **`incremental`** flag.  
-  - For each qubit, spawns a **Tokio task** that runs `calibrate_one_qubit` (see `routines`).  
-  - Collects successful `QubitCalibration` values into a `CalibrationReport`. Failed qubits are **omitted** from the report vector; failures are expected to be recorded via the health monitor inside the routine (the store still holds **last known good** parameters for that qubit if a previous commit succeeded).
-
-- **`run_periodic_calibration_scheduler`**  
-  - An **infinite** `tokio::time::interval` loop intended as a sketch of a long-running service process. It is **not** invoked by the default binary (to keep `cargo run` finite).
-
-**Validation rule on the report:** `validation_passed` is true only if **every** requested qubit produced a successful calibration **and** per-qubit metrics pass fidelity, crosstalk template, and `T2 ≤ T1` checks.
-
----
+- **`run_calibration_cycle_parallel`** — Spawns one Tokio task per qubit calling `calibrate_one_qubit`; builds `CalibrationReport`; `validation_passed` requires **all** requested qubits succeeded and pass global checks.
+- **`run_periodic_calibration_scheduler`** — Infinite interval loop (not called from default `main`).
 
 ### 2. Calibration routines (`src/routines.rs`)
 
-Routines are **async** and use only the **`QuantumHardware`** trait, not a concrete device:
+Async steps over **`QuantumHardware`**: spectroscopy grid, T1/T2, gate tune, crosstalk template via `pulse::schedule_has_conflicts`. **Incremental** path can reuse stored T1/T2 when “vitals” look fine. Integrates **health** and **parameter_store** on success/failure.
 
-- **`routine_frequency_sweep`** — Steps a probe frequency across a coarse grid (mock: 4.8–5.4 GHz, 0.02 GHz steps), sends spectroscopy-tagged pulses, reads scalar responses, and picks the peak (Lorentzian-shaped response in the mock).
+### 3. Hardware (`src/hardware.rs`)
 
-- **`routine_measure_t1` / `routine_measure_t2`** — Drive mock relaxation/dephasing experiments via tagged pulses and read nanosecond estimates.
-
-- **`routine_gate_tune`** — Returns a mock π-pulse duration and single-qubit fidelity estimate.
-
-- **`calibrate_one_qubit`** — Orchestrates the full pipeline for one qubit:
-  - Runs frequency sweep.
-  - Optionally **skips T1/T2 remeasurement** when `incremental` is true and stored parameters are already within policy (see [Incremental calibration](#incremental-calibration)).
-  - Compares new drive frequency to **previous** store entry; if drift exceeds `HealthThresholds::max_freq_drift_ghz`, records a **drift warning** (still may succeed).
-  - Validates fidelity, `T2 ≤ T1`, and a **crosstalk template** (see [Pulse schedules](#pulse-schedules-and-crosstalk-checks)).
-  - On success: **`ParameterStore::commit_success`** (bumps generation), **`HealthMonitor::record_success`**.
-  - On validation failure: **`HealthMonitor::record_failure`** (may trigger escalation after repeated failures).
-
-**Error type:** `CalibrationError` wraps `HardwareError` or static validation messages.
-
----
-
-### 3. Hardware interface (`src/hardware.rs`)
-
-**Trait (`async_trait`):**
-
-```rust
-async fn send_pulse(&self, qubit_id: u8, pulse: Pulse) -> Result<(), HardwareError>;
-async fn read_result(&self, qubit_id: u8) -> Result<Measurement, HardwareError>;
-```
-
-**`Measurement`** is an enum covering spectroscopy amplitude, T1/T2, and gate-tune results.
-
-**Mock driver (`MockQuantumHardware`):**
-
-- Holds per-qubit **true resonance** frequencies (GHz) and last-sent `Pulse` per line.
-- Uses **`Pulse::start_ns` as a diagnostic opcode** when talking to the mock (this is a simulation convention—not a statement about real hardware APIs):
-
-  | `start_ns` constant | Meaning |
-  |---------------------|---------|
-  | `diagnostic::SPECTROSCOPY` (0) | Spectroscopy probe at `pulse.frequency_ghz` |
-  | `diagnostic::T1` (1) | T1 experiment |
-  | `diagnostic::T2` (2) | T2 experiment |
-  | `diagnostic::GATE_TUNE` (3) | Gate calibration |
-
-**Important:** Experiment **timeline** pulses (nanosecond start times) used only in `pulse` schedule analysis are separate from this mock encoding; the crosstalk template check in `routines` does not send those pulses through the hardware trait.
-
-**`HardwareError`:** `InvalidQubit`, `NotArmed` (e.g. read without a preceding arm pulse).
-
----
+`QuantumHardware::send_pulse` / `read_result`. Mock uses **`Pulse::start_ns`** as **diagnostic opcodes** (`SPECTROSCOPY`, `T1`, `T2`, `GATE_TUNE`) — simulation-only; real systems would use explicit command types.
 
 ### 4. Parameter store (`src/parameter_store.rs`)
 
-- **`CalibrationParams`** fields: `drive_frequency_ghz`, `t1_ns`, `t2_ns`, `pi_pulse_duration_ns`, `single_qubit_fidelity`, `generation`.
-- **`ParameterStore`** is backed by `Arc<RwLock<HashMap<u8, CalibrationParams>>>` (async-friendly `tokio::sync::RwLock`).
-- **`commit_success`** inserts or updates the row and sets **`generation`** to `previous + 1` (or `1` on first success).
-- Failed calibration attempts **do not** clear the map entry; operators always have a **last known good** configuration until a new success overwrites it.
-- **`snapshot`** returns a copy of the map for inspection or UI.
+`CalibrationParams` + per-qubit generations; **`commit_success`** on pass only.
+
+### 5. Health (`src/health.rs`)
+
+`HealthThresholds`, `Alert` (`DriftWarning`, `EscalateHuman`), consecutive failure counting (`ESCALATE_AFTER_FAILURES = 3`).
 
 ---
 
-### 5. Health monitor (`src/health.rs`)
+## AI / ML integration
 
-- **`HealthThresholds`** (defaults): `min_t1_ns = 30_000`, `max_freq_drift_ghz = 0.08`, `min_fidelity = 0.99`.
-- **`Alert`**: `DriftWarning` or `EscalateHuman` (implements `Display` for logging).
-- **`HealthMonitor`**:
-  - **`record_success(qubit)`** resets consecutive failure count for that qubit.
-  - **`record_failure(qubit, reason)`** increments failures; after **`ESCALATE_AFTER_FAILURES` (3)** consecutive failures, appends an **`EscalateHuman`** alert and resets the counter (policy choice to avoid duplicate spam; adjust in production).
-  - **`warn_drift`** for frequency moves vs last good.
-  - **`take_alerts`** drains the alert vector for logging or downstream notification.
+### Predictive drift (`src/drift_predictor.rs`)
+
+- **`FrequencyObservation`** — `{ timestamp_secs, frequency_ghz }` (lab clock or epoch seconds).
+- **`DriftModel::train`** — Least-squares **slope** (GHz/s) over a qubit’s window (max **20** points).
+- **`seconds_until_recalibration_needed`** — Linear extrapolation of how long until a **tolerance** budget (GHz) is consumed; returns **`None`** if drift rate is negligible, **`Some(0)`** if overdue.
+- **`PredictiveDriftDetector`** — `record_observation`, **`print_predictions`**, **`qubits_due_within(horizon_secs, now_secs)`** sorted by urgency.
+
+**Integration point (production):** After each successful calibration, append **`(qubit_id, drive_frequency_ghz, now)`** to this history and consult **`qubits_due_within`** before or alongside **`schedule::calibration_due`** to prioritize which qubits to calibrate next.
+
+### Model registry (`src/ml_models.rs`)
+
+- **`DriftForecastModel`** trait — `name`, **`fit`**, **`predict(t)`**, optional **`seconds_until_drift`** (forward scan vs tolerance). **Send + Sync** so the same interface can later wrap **PyO3** Python models or remote inference.
+- **Built-in models**
+  - **LinearRegression** — steady drift; **2+** points.
+  - **ExponentialDecay** — three-point heuristic for **settling** toward a baseline (e.g. post thermal transient); **3+** points; uses anchored time \(t - t_0\).
+  - **MovingAverage** — last up-to-5 points mean + local slope; conservative baseline when trend is noisy.
+- **`ModelEvaluator`**
+  - **`evaluate_all`** — **leave-one-out cross-validation (LOOCV)** mean absolute error (MAE) per model; results sorted best-first.
+  - **`select_best`** — LOOCV pick, then **refit winner on full history** for deployment.
+
+**`main` demo:** feeds synthetic multi-qubit history into **`PredictiveDriftDetector`**, prints predictions and due-within-2h list; runs **`evaluate_all` / `select_best`** on a steady-drift qubit-0 series.
 
 ---
 
 ## Data flow (one calibration cycle)
 
-1. **Scheduler** receives a tick (or `main` calls `run_calibration_cycle_parallel` once).
-2. For each qubit ID, a **task** runs **`calibrate_one_qubit`** with shared `QuantumHardware`, `ParameterStore`, and `HealthMonitor`.
-3. Routines call **`send_pulse` / `read_result`** on the trait object.
-4. On success, **parameter store** is updated and **health** records success; on failure, **health** records failure; store keeps prior good params.
-5. **Scheduler** builds **`CalibrationReport`** from successful qubits and sets **`validation_passed`** according to global checks.
+1. Scheduler (or `main`) starts **`run_calibration_cycle_parallel`**.
+2. Per-qubit tasks run **`calibrate_one_qubit`** → hardware trait → store + health.
+3. Report assembled; **AI** path would additionally **`record_observation`** per successful drive frequency.
 
 ---
 
 ## Pulse schedules and crosstalk checks
 
-Module **`pulse`** (`src/pulse.rs`):
-
-- **`Pulse`**: `channel` (control line / AWG channel id), `start_ns` (schedule time), `frequency_ghz`.
-- **`validate_pulse`**: channel ≤ 7, frequency in `(0, 10]` GHz (exercise-style bounds).
-- **`sort_pulses_by_start_ns`**, **`pulses_conflict`**, **`schedule_has_conflicts`**: two pulses on the **same channel** with start times within **50 ns** are treated as a **temporal conflict** (O(n²) pairwise check; documented as acceptable for small schedules; production would sort by channel and window-scan).
-- Used by **`routines`** to assert a **safe template** schedule before trusting crosstalk posture for that mock scenario.
+**`pulse`**: `Pulse`, **`validate_pulse`**, sorting, **50 ns** same-channel conflict detection (**O(n²)**; document scaling via sort + sliding window). Used for **template** validation in routines, not for mock diagnostic opcodes.
 
 ---
 
 ## Supporting modules (library)
 
-### `calibration` (`src/calibration.rs`)
-
-- Shared report types used by both the async pipeline and the sync mock.
-- **`MockTransmonSystem::run_full_calibration_suite`**: synchronous, all-qubit suite using the same numerical models as the mock hardware (useful for fast tests without Tokio).
-- **`run_validation_benchmark`**: returns whether `CalibrationReport::validation_passed` is true.
-
-### `schedule` (`src/schedule.rs`)
-
-- **`CalibrationPolicy`**: `periodic_interval` (`std::time::Duration`).
-- **`calibration_due`**: returns `Some(RecalibrationCause)` when:
-  - **Chip swap** is pending (highest priority), or
-  - No prior calibration exists (**cold start** → periodic), or
-  - Elapsed time since last success ≥ policy interval.
-
-Unit tests cover chip-swap priority, cold start, and “recently calibrated → not due.”
-
-### `controller` (`src/controller.rs`)
-
-- **`CalibrationController`**: combines policy with **`std::time::Instant`** timestamps and a **pending chip-swap** flag; **`run_full_calibration_if_due`** drives the **sync** `MockTransmonSystem`.  
-- Suitable for simple simulations or bridging to a non-async subsystem; the default **`main`** uses the **async five-layer** path instead.
+- **`calibration`** — Shared `CalibrationReport` / `MockTransmonSystem` (sync).
+- **`schedule`** — **`calibration_due`**: chip swap > cold start > periodic interval.
+- **`controller`** — Sync **`CalibrationController`** + **`MockTransmonSystem`** (tests / alternate entrypoint; not required by default `main`).
 
 ---
 
 ## Incremental calibration
 
-When **`incremental == true`** in `run_calibration_cycle_parallel`, **`maybe_measure_t1_t2`** in `routines` may **reuse** `t1_ns` and `t2_ns` from the parameter store if they already satisfy **`t1_ns ≥ min_t1_ns`** and **`t2_ns ≤ t1_ns`**, avoiding redundant relaxation experiments.
-
-**Production note:** A real system would still run a **cheap sanity check** (short Ramsey or spot-check) before trusting stale T1/T2; the mock documents the *intent* to reduce unnecessary work when vitals remain in range.
+With **`incremental == true`**, T1/T2 may be **reused** from the store when values already look healthy. Production should add **short verification** pulses before trusting stale T1/T2.
 
 ---
 
 ## Testing
 
-| Test area | Location | What it checks |
-|-----------|----------|----------------|
-| Spectroscopy peak | `calibration::tests` | Sweep finds frequency near ground truth |
-| Sync full suite | `calibration::tests` | `MockTransmonSystem` report validity |
-| Schedule policy | `schedule::tests` | Chip swap, cold start, suppression after recent cal |
-| Parallel async cycle | `job_scheduler::tests` | Two qubits, store populated, generations ≥ 1, validation passes |
-
-Run all tests with `cargo test`.
+| Area | Location |
+|------|----------|
+| Spectroscopy / sync suite | `calibration::tests` |
+| Schedule policy | `schedule::tests` |
+| Parallel cycle + store | `job_scheduler::tests` |
+| Linear drift + fleet urgency | `drift_predictor::tests` |
+| LOOCV, linear / exponential fit | `ml_models::tests` |
 
 ---
 
-## Design tradeoffs and production notes
+## Current limitations
 
-- **Parallelism:** Per-qubit tasks reduce wall-clock time versus strictly sequential calibration; contention on shared real hardware would require **serialization** or **resource locks** not modeled here.
-- **O(n²) conflict detection:** Documented in `pulse`; fine for small `n`; scale with **sort + sliding window** per channel.
-- **Mock vs real hardware:** The trait is the integration seam; real stacks would add timeouts, DMA, waveform upload, IQ demodulation, and error models.
-- **Persistence:** The in-memory `ParameterStore` would become a database or file with **versioning** and audit fields in production.
-- **Escalation policy:** The “3 strikes” rule is illustrative; real ops would integrate paging, ticket systems, and optional **automatic rollback** to last good parameters for execution paths.
+- **No real hardware** — Mock responses only; no timing guarantees, noise, or IQ data.
+- **Drift model is intentionally simple** — Single linear slope per window in `drift_predictor`; no confidence intervals, no multi-parameter state estimation.
+- **ML models are lightweight** — Closed-form or heuristic fits, not trained neural nets; **LOOCV** is **O(n × models)** on small windows only.
+- **Exponential fit** — Three-point heuristic; fragile on bad spacing or non-monotonic data (returns **`NumericalInstability`**).
+- **AI not wired into the async scheduler yet** — `main` runs calibration then a **separate** AI demo; production would **close the loop** (observations from real commits, schedule decisions from `qubits_due_within` + policy).
+- **Parameter store is in-memory** — No durability across process restarts.
+- **Health escalation** — In-memory alerts only; no external notification channel.
+- **Parallel calibration** — Assumes independent qubit tasks; real shared AWG/LO resources would need **locking** and **serialization** rules.
+
+---
+
+## Future improvements
+
+These are **deliberately out of scope** for the current crate but match how this codebase is **structured to evolve**:
+
+1. **PyO3 bridge** — Implement **`DriftForecastModel`** for wrappers around **scikit-learn** / **PyTorch** models trained offline or online.
+2. **Gaussian process regression** — Time-series drift with **uncertainty** (“recalibrate within X hours with 95% confidence”).
+3. **Sequence models (LSTM / Transformer)** — Capture **memory** and **non-linear** drift in frequency traces.
+4. **Reinforcement learning scheduler** — State = calibration snapshot + queue; actions = which qubit (or which routine) to run; reward = −downtime − unnecessary cal cost; train with **stable-baselines3** or similar, policy served via Rust or Python sidecar.
+5. **Anomaly detection on full vectors** — Extend **health** beyond thresholds: **multivariate** unusualness on \((f, T_1, T_2, \text{fid}, \ldots)\).
+6. **LLM diagnostics** — Feed structured **`Alert`** + `DriftModel::summary` into an **RAG** or tool-calling agent for operator-facing explanations (non-experts).
+7. **Persistent store + audit** — SQLite/Postgres, **versioned** parameters, who/what triggered each cal.
+8. **Closed-loop integration** — Single service: **`run_calibration_cycle_parallel`** selects qubit subset from **`PredictiveDriftDetector::qubits_due_within`** merged with **`calibration_due`**.
 
 ---
 
@@ -237,21 +199,24 @@ Cargo.toml
 Cargo.lock
 README.md
 src/
-  lib.rs              # Crate docs, module exports
-  main.rs             # Binary: async calibration pipeline demo
-  job_scheduler.rs    # Layer 1: parallel cycle + optional periodic loop
-  routines.rs         # Layer 2: async calibration steps + orchestration
-  hardware.rs         # Layer 3: trait + mock quantum hardware
-  parameter_store.rs  # Layer 4: last known good parameters
-  health.rs           # Layer 5: thresholds, alerts, escalation
-  calibration.rs      # Shared types + sync mock suite
-  pulse.rs            # Pulse schedule + conflict detection
-  schedule.rs           # When to recalibrate (pure policy)
-  controller.rs         # Sync controller + MockTransmonSystem driver
+  lib.rs
+  main.rs              # thin wrapper → `demo::run_all_demos`
+  demo.rs              # calibration + AI demos (uses `crate::` internally)
+  job_scheduler.rs
+  routines.rs
+  hardware.rs
+  parameter_store.rs
+  health.rs
+  calibration.rs
+  pulse.rs
+  schedule.rs
+  controller.rs
+  drift_predictor.rs   # AI: linear drift + fleet urgency
+  ml_models.rs         # DriftForecastModel trait + LOOCV registry
 ```
 
 ---
 
-## License / naming
+## License
 
-The package name in `Cargo.toml` is **`test_rust_project`** (workspace default). The **module and type names** inside `src/` are already domain-oriented (`QuantumHardware`, `CalibrationParams`, etc.).
+Add a `LICENSE` file if you distribute the crate; none is bundled by default.

@@ -8,13 +8,19 @@
 //! 4. **[`parameter_store`]** — Last known good parameters; failed runs do not erase the store.
 //! 5. **[`health`]** — Thresholds, drift warnings, escalate after repeated failure.
 //!
-//! Supporting modules: **[`calibration`]** (shared types + sync mock), **[`controller`]**, **[`pulse`]**, **[`schedule`]**.
+//! Supporting modules: **[`calibration`]**, **[`controller`]**, **[`pulse`]**, **[`schedule`]**.
+//! **AI / ML:** **[`drift_predictor`]** (fleet linear drift + urgency), **[`ml_models`]**
+//! (`DriftForecastModel` trait, LOOCV model selection).
+//! **[`demo`]** — `cargo run` entrypoints (`run_all_demos`).
 
 pub mod calibration;
 pub mod controller;
+pub mod demo;
+pub mod drift_predictor;
 pub mod health;
 pub mod hardware;
 pub mod job_scheduler;
+pub mod ml_models;
 pub mod parameter_store;
 pub mod pulse;
 pub mod routines;

@@ -1,7 +1,17 @@
 [package]
-name = "test_rust_project"
+name = "quantum_calibration"
 version = "0.1.0"
 edition = "2024"
+description = "Automated quantum calibration and control (mock hardware, drift forecasting)"
+repository = "https://github.com/Amankrah/quantum_calibration"
+
+[lib]
+name = "quantum_calibration"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quantum_calibration"
+path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1"
